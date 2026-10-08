@@ -556,3 +556,36 @@ class TestOnlineDPOVisionTrainer(TrlTestCase):
         trainer.train()
 
         assert trainer.state.log_history[-1]["train_loss"] is not None
+
+    @pytest.mark.parametrize("model_id", ["trl-internal-testing/tiny-Idefics2ForConditionalGeneration"])
+    def test_training_step_with_image_column(self, model_id):
+        # Regression test for #7189: with an "image" column, the vision path runs end to end. Idefics2 returns 5D
+        # `pixel_values` and its processor rejects text without image tokens.
+        dataset_dict = {
+            "prompt": [[{"role": "user", "content": "Describe the image."}]] * 2,
+            "image": [Image.fromarray(np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)) for _ in range(2)],
+        }
+        model = AutoModelForImageTextToText.from_pretrained(model_id, dtype="float32")
+        processor = AutoProcessor.from_pretrained(model_id)
+
+        def reward_func(prompts, **kwargs):
+            return [0.0] * len(prompts)
+
+        training_args = OnlineDPOConfig(
+            output_dir=self.tmp_dir,
+            per_device_train_batch_size=2,
+            max_steps=1,
+            max_new_tokens=1,
+            report_to="none",
+        )
+        trainer = OnlineDPOTrainer(
+            model=model,
+            reward_funcs=reward_func,
+            args=training_args,
+            processing_class=processor,
+            train_dataset=Dataset.from_dict(dataset_dict),
+        )
+
+        loss = trainer.training_step(trainer.model, dataset_dict)
+
+        assert torch.isfinite(loss)

@@ -100,6 +100,11 @@ logger = get_logger(__name__)
 RewardFunc = str | PreTrainedModel | Callable[..., list[float | None]]
 
 
+def _repeat_along_batch(tensor: torch.Tensor, repeats: int) -> torch.Tensor:
+    """Repeat `tensor` along its first dimension, whatever its rank (e.g. Idefics2's 5D `pixel_values`)."""
+    return tensor.repeat(repeats, *([1] * (tensor.dim() - 1)))
+
+
 class OnlineDPOTrainer(_BaseTrainer):
     r"""
     Initialize OnlineDPOTrainer.
@@ -1016,14 +1021,9 @@ class OnlineDPOTrainer(_BaseTrainer):
         # Prepare vision inputs if available
         vision_generation_kwargs = {}
         if self.is_vision_model and images is not None:
-            if "pixel_values" in prompt_inputs:
-                vision_generation_kwargs["pixel_values"] = prompt_inputs["pixel_values"].repeat(2, 1, 1, 1)
-            if "pixel_attention_mask" in prompt_inputs:
-                vision_generation_kwargs["pixel_attention_mask"] = prompt_inputs["pixel_attention_mask"].repeat(2, 1)
-            if "image_sizes" in prompt_inputs:
-                vision_generation_kwargs["image_sizes"] = prompt_inputs["image_sizes"].repeat(2, 1)
-            if "image_grid_thw" in prompt_inputs:
-                vision_generation_kwargs["image_grid_thw"] = prompt_inputs["image_grid_thw"].repeat(2, 1)
+            for key in ("pixel_values", "pixel_attention_mask", "image_sizes", "image_grid_thw"):
+                if key in prompt_inputs:
+                    vision_generation_kwargs[key] = _repeat_along_batch(prompt_inputs[key], 2)
 
         with (
             profiling_context(self, "transformers.generate"),
@@ -1179,12 +1179,17 @@ class OnlineDPOTrainer(_BaseTrainer):
             # For vision models with transformers generation, we need to prepare vision inputs
             # Process the images to get vision inputs that can be passed through the forward pass
             vision_inputs = {}
-            kwargs = {"images": [[img] for img in images]}
-            processed = self.processing_class(
-                text=[""] * len(images),  # Dummy text for vision processing
-                return_tensors="pt",
-                **kwargs,
-            )
+            # Use the image processor directly: calling the full processor with empty text fails for processors that
+            # check the number of image tokens in the text against the number of images (e.g. Idefics2)
+            image_processor = getattr(self.processing_class, "image_processor", None)
+            if image_processor is not None:
+                processed = image_processor(images=[[img] for img in images], return_tensors="pt")
+            else:
+                processed = self.processing_class(
+                    text=[""] * len(images),  # Dummy text for vision processing
+                    images=[[img] for img in images],
+                    return_tensors="pt",
+                )
             # Handle DataParallel wrapped models
             model_device = getattr(model, "device", None)
             model_dtype = getattr(model, "dtype", None)
@@ -1194,15 +1199,12 @@ class OnlineDPOTrainer(_BaseTrainer):
             # Move vision tensors to device and convert to model dtype
             # Need to duplicate for 2 completions per prompt
             if "pixel_values" in processed:
-                vision_inputs["pixel_values"] = (
-                    processed["pixel_values"].to(model_device, dtype=model_dtype).repeat(2, 1, 1, 1)
+                vision_inputs["pixel_values"] = _repeat_along_batch(
+                    processed["pixel_values"].to(model_device, dtype=model_dtype), 2
                 )
-            if "pixel_attention_mask" in processed:
-                vision_inputs["pixel_attention_mask"] = processed["pixel_attention_mask"].to(model_device).repeat(2, 1)
-            if "image_sizes" in processed:
-                vision_inputs["image_sizes"] = processed["image_sizes"].to(model_device).repeat(2, 1)
-            if "image_grid_thw" in processed:
-                vision_inputs["image_grid_thw"] = processed["image_grid_thw"].to(model_device).repeat(2, 1)
+            for key in ("pixel_attention_mask", "image_sizes", "image_grid_thw"):
+                if key in processed:
+                    vision_inputs[key] = _repeat_along_batch(processed[key].to(model_device), 2)
 
         logprobs = self._forward(model, prompt_ids, prompt_mask, completion_ids, completion_mask, vision_inputs)
         with torch.no_grad():
