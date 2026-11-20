@@ -3884,7 +3884,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
         return t_pause, t_barrier, t_transfer
 
     def _save(self, output_dir=None, state_dict=None):
-        if not self.is_fsdp_enabled or self.accelerator.mixed_precision not in ("bf16", "fp16"):
+        if not self.is_fsdp_enabled or self.accelerator.mixed_precision not in ("bf16", "fp16", "fp8"):
             return super()._save(output_dir, state_dict)
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}[self.compute_dtype]
