@@ -751,6 +751,26 @@ training_args = AsyncGRPOConfig(
 )
 ```
 
+### Prefix Grouper: Efficient GRPO Training through Shared-Prefix Forward
+
+**📜 Paper**: https://huggingface.co/papers/2506.05433
+
+Observes that in GRPO every completion of a group shares a prompt, yet the prompt is re-encoded once per completion, which dominates compute when the prompt is long. Prefix Grouper encodes the shared prefix once: the prefix and all completions of a group are concatenated into a single sequence, `[prompt | completion_1 | … | completion_G]`, and attention is split so prefix tokens attend within the prefix while each completion attends to the prefix and itself. The paper shows this is training-equivalent to standard GRPO — identical forward outputs and backward gradients. Used in TRL via [`GRPOTrainer`] with `prefix_sharing=True`, which implements the same packing with an explicit attention mask instead of a custom kernel.
+
+```python
+from trl import GRPOConfig, GRPOTrainer
+
+# The paper doesn't specify a canonical hyperparameter set for the packing itself; the setting below enables it.
+training_args = GRPOConfig(
+    ...,
+    prefix_sharing=True,
+)
+trainer = GRPOTrainer(
+    ...,
+    args=training_args,
+)
+```
+
 ## Optimal Advantage Regression
 
 Papers relating to the [`experimental.a2po.A2POTrainer`].

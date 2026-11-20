@@ -133,6 +133,103 @@ RewardFunc = str | PreTrainedModel | Callable[..., list[float | None]]
 RolloutFunc = Callable[[list[str], "GRPOTrainer"], dict[str, Any]]
 
 
+def _pack_prompt_groups(input_ids, attention_mask, logits_to_keep):
+    """Pack the rows that share a prompt into single rows, forwarding the prompt once.
+
+    The dense GRPO batch repeats the prompt of a group once per completion. This packs each group of rows with
+    identical prompt tokens into one row, `[prompt | completion_1 | … | completion_G]`, with an explicit 4D
+    attention mask so each completion sees the prompt and itself, and never another completion.
+
+    The logit that predicts a completion token sits one position before it. For the first token of every completion
+    after the first, that predecessor would be the previous completion's last token, which is the wrong context. A
+    copy of the last prompt token is therefore inserted before each of those completions, with the same position id
+    as the last prompt token and attending only to the prompt: it has the same token, the same position id and the
+    same attended keys as the last prompt token, so its hidden state — and the logits it produces — are the same.
+    Its label is -100; it is never scored.
+
+    Args:
+        input_ids (`torch.Tensor` of shape `(B, P+C)`):
+            Dense batch: left-padded prompts followed by right-padded completions.
+        attention_mask (`torch.Tensor` of shape `(B, P+C)`):
+            1 for real tokens, 0 for padding.
+        logits_to_keep (`int`):
+            Width of the completion part, i.e. `input_ids.size(1)` minus the prompt width.
+
+    Returns:
+        `tuple` with:
+            - `packed_rows` (`list` of `tuple`): one entry per group that has at least one non-empty completion,
+              `(input_ids, attention_mask, position_ids, labels)`, of shapes `(L,)`, `(L, L)`, `(L,)` and `(L,)`.
+              The mask is `bool`: `True` where attention is allowed.
+            - `scatter` (`list` of `tuple`): one `(row, group_index, start, length)` entry per row with a non-empty
+              completion, giving the packed positions holding that row's completion tokens, so the caller can scatter
+              log-probs back to the padded `(B, logits_to_keep)` layout. Positions are token positions; the fused
+              LM head returns log-probs shifted by one, so the caller reads them at `[start-1, start+length-1)`.
+    """
+    prompt_width = input_ids.size(1) - logits_to_keep
+    prompt_lengths = attention_mask[:, :prompt_width].sum(dim=1).tolist()
+    completion_lengths = attention_mask[:, prompt_width:].sum(dim=1).tolist()
+    if min(prompt_lengths) == 0:
+        raise ValueError(
+            "`prefix_sharing=True` needs at least one prompt token per sample: the first completion token of a "
+            "sample without one has no predecessor in the packed row to take its logit from."
+        )
+    # Group rows by their prompt tokens. Rows are shuffled in `_prepare_inputs`, so groups cannot be assumed
+    # contiguous; identical prompt tokens are the group.
+    groups = {}
+    for row in range(input_ids.size(0)):
+        prompt_start = prompt_width - prompt_lengths[row]
+        prompt = tuple(input_ids[row, prompt_start:prompt_width].tolist())
+        groups.setdefault(prompt, []).append(row)
+
+    packed_rows = []
+    scatter = []
+    for prompt, rows in groups.items():
+        prompt_len = len(prompt)
+        # The non-empty completions, in row order; the first needs no duplicate prompt token, each following one
+        # is preceded by a copy of the last prompt token (see docstring).
+        segments = [
+            (row, input_ids[row, prompt_width : prompt_width + completion_lengths[row]].tolist())
+            for row in rows
+            if completion_lengths[row] > 0
+        ]
+        if not segments:
+            continue  # a group of fully masked completions scores nothing; its log-probs stay zero
+        packed_ids = list(prompt)
+        packed_pos = list(range(prompt_len))
+        packed_labels = [-100] * prompt_len
+        segment_starts = []
+        for i, (_, completion) in enumerate(segments):
+            if i > 0:
+                packed_ids.append(prompt[-1])
+                packed_pos.append(prompt_len - 1)
+                packed_labels.append(-100)
+            segment_starts.append(len(packed_ids))
+            packed_ids.extend(completion)
+            packed_pos.extend(range(prompt_len, prompt_len + len(completion)))
+            packed_labels.extend(completion)
+        packed_len = len(packed_ids)
+        # Start from the causal mask, then carve out what a completion must not see: previous segments and the
+        # duplicate prompt tokens, which are not part of any completion's context. Duplicate rows keep only the
+        # prompt: they must not attend to themselves, or their hidden state would differ from the last prompt
+        # token's (an extra key in the softmax).
+        mask = torch.tril(torch.ones((packed_len, packed_len), dtype=torch.bool))
+        for start, (_, completion) in zip(segment_starts, segments, strict=True):
+            mask[start : start + len(completion), prompt_len:start] = False
+            if start > prompt_len:
+                mask[start - 1, prompt_len:] = False
+        packed_rows.append(
+            (
+                torch.tensor(packed_ids, device=input_ids.device),
+                mask.to(device=input_ids.device),
+                torch.tensor(packed_pos, device=input_ids.device),
+                torch.tensor(packed_labels, device=input_ids.device),
+            )
+        )
+        for start, (row, completion) in zip(segment_starts, segments, strict=True):
+            scatter.append((row, len(packed_rows) - 1, start, len(completion)))
+    return packed_rows, scatter
+
+
 class _SupportsReset(Protocol):
     def reset(self, **kwargs) -> str | None: ...
 
@@ -889,6 +986,24 @@ class GRPOTrainer(_BaseTrainer):
                 "`target_modules`."
             )
         self.mask_truncated_completions = args.mask_truncated_completions
+        self.prefix_sharing = args.prefix_sharing
+        if self.prefix_sharing:
+            # `self.model` is only set by `super().__init__` below; use the local model here.
+            attn_implementation = model.config._attn_implementation.split("@")[0].split(":")[0]
+            if attn_implementation not in {"sdpa", "eager"}:
+                raise ValueError(
+                    f"`prefix_sharing=True` requires an attention implementation that accepts a 4D attention mask, "
+                    f"got {attn_implementation!r}. The packed forward separates the completions of a group with an "
+                    "explicit mask, which Flash Attention does not accept. Set `attn_implementation` in the model "
+                    "configuration or disable `prefix_sharing`."
+                )
+            if args.use_liger_kernel:
+                raise ValueError("`prefix_sharing=True` is not supported with `use_liger_kernel=True`.")
+            if self._is_vlm:
+                raise ValueError(
+                    "`prefix_sharing=True` is not supported for vision-language models: the multimodal inputs are "
+                    "indexed per sample and stay on the padded forward."
+                )
         self.top_entropy_quantile = args.top_entropy_quantile
         self.entropy_coef = args.entropy_coef
         self.use_adaptive_entropy = args.use_adaptive_entropy
@@ -1540,6 +1655,18 @@ class GRPOTrainer(_BaseTrainer):
         sampling_mask=None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Compute log-probs, (optionally) entropies, and (optionally) the MoE load-balancing aux loss."""
+        if (
+            self.prefix_sharing
+            and sampling_mask is None
+            and pixel_values is None
+            and token_type_ids is None
+            and mm_token_type_ids is None
+        ):
+            # Packing needs the plain token tensors: a sampling mask (vLLM importance sampling) and multimodal
+            # inputs are indexed per sample and stay on the dense forward.
+            return self._get_per_token_logps_and_entropies_packed(
+                model, input_ids, attention_mask, logits_to_keep, batch_size, compute_entropy, compute_aux_loss
+            )
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
         all_entropies = []
@@ -1612,6 +1739,93 @@ class GRPOTrainer(_BaseTrainer):
 
         logps = torch.cat(all_logps, dim=0)
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
+        aux_loss = torch.stack(all_aux_losses).mean() if compute_aux_loss else None
+        return logps, entropies, aux_loss
+
+    def _get_per_token_logps_and_entropies_packed(
+        self,
+        model,
+        input_ids,
+        attention_mask,
+        logits_to_keep,
+        batch_size=None,
+        compute_entropy=False,
+        compute_aux_loss=False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Same as `_get_per_token_logps_and_entropies`, with the prompt of each group forwarded once.
+
+        Groups are packed by `_pack_prompt_groups` and forwarded in chunks of at most `batch_size * seq_len`
+        tokens, the token count of a dense chunk. A single group can exceed that budget on its own (when the
+        micro-batch is smaller than the group); it still runs as one chunk, which holds fewer tokens than the
+        dense chunk it replaces. Log-probs and entropies are scattered back into the padded `(B, logits_to_keep)`
+        layout the callers expect; positions outside the completions stay zero.
+        """
+        batch_size = batch_size or input_ids.size(0)
+        packed_rows, scatter = _pack_prompt_groups(input_ids, attention_mask, logits_to_keep)
+        if not packed_rows:
+            # Every completion is fully masked; nothing to score.
+            logps = torch.zeros((input_ids.size(0), logits_to_keep), device=input_ids.device)
+            entropies = torch.zeros_like(logps) if compute_entropy else None
+            return logps, entropies, None
+        # Greedy chunking: a chunk holds whole groups and costs rows * max length after padding.
+        token_budget = batch_size * input_ids.size(1)
+        chunks = []
+        chunk = []
+        chunk_len = 0
+        for group_index, packed_row in enumerate(packed_rows):
+            row_len = packed_row[0].size(0)
+            new_len = max(chunk_len, row_len)
+            if chunk and (len(chunk) + 1) * new_len > token_budget:
+                chunks.append(chunk)
+                chunk = [group_index]
+                chunk_len = row_len
+            else:
+                chunk.append(group_index)
+                chunk_len = new_len
+        if chunk:
+            chunks.append(chunk)
+
+        logps = None
+        entropies = None
+        all_aux_losses = []
+        for chunk in chunks:
+            rows = [packed_rows[group_index] for group_index in chunk]
+            max_len = max(row[0].size(0) for row in rows)
+            chunk_ids = torch.zeros((len(rows), max_len), dtype=torch.long, device=input_ids.device)
+            chunk_mask = torch.zeros((len(rows), 1, max_len, max_len), dtype=torch.bool, device=input_ids.device)
+            chunk_pos = torch.zeros((len(rows), max_len), dtype=torch.long, device=input_ids.device)
+            chunk_labels = torch.full((len(rows), max_len), -100, dtype=torch.long, device=input_ids.device)
+            for j, (ids, mask, pos, labels) in enumerate(rows):
+                length = ids.size(0)
+                chunk_ids[j, :length] = ids
+                chunk_mask[j, 0, :length, :length] = mask
+                chunk_pos[j, :length] = pos
+                chunk_labels[j, :length] = labels
+            model_inputs = {"input_ids": chunk_ids, "attention_mask": chunk_mask, "position_ids": chunk_pos}
+            # MoE models: request router logits so the model returns the load-balancing loss
+            if compute_aux_loss:
+                model_inputs["output_router_logits"] = True
+            with self.accelerator.autocast():
+                outputs = model(**model_inputs, labels=chunk_labels, fused_lm_head=True)
+            if logps is None:
+                logps = torch.zeros(
+                    (input_ids.size(0), logits_to_keep), dtype=outputs.log_probs.dtype, device=input_ids.device
+                )
+                if compute_entropy:
+                    entropies = torch.zeros(
+                        (input_ids.size(0), logits_to_keep), dtype=outputs.entropy.dtype, device=input_ids.device
+                    )
+            chunk_index = {group_index: j for j, group_index in enumerate(chunk)}
+            for row, group_index, start, length in scatter:
+                if group_index in chunk_index:
+                    j = chunk_index[group_index]
+                    # The fused head shifts: `log_probs`/`entropy` have length L-1, entry j scoring the token at
+                    # position j+1, so a segment at [start, start+length) is read at [start-1, start+length-1).
+                    logps[row, :length] = outputs.log_probs[j, start - 1 : start + length - 1]
+                    if compute_entropy:
+                        entropies[row, :length] = outputs.entropy[j, start - 1 : start + length - 1]
+            if compute_aux_loss:
+                all_aux_losses.append(outputs.aux_loss)
         aux_loss = torch.stack(all_aux_losses).mean() if compute_aux_loss else None
         return logps, entropies, aux_loss
 

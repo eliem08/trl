@@ -271,6 +271,13 @@ class GRPOConfig(_BaseConfig):
             When enabled, truncated completions are excluded from the loss calculation, preventing them from being
             incorrectly penalized and introducing noise during training. According to the
             [DAPO](https://huggingface.co/papers/2503.14476) paper, this is a good practice for training stability.
+        prefix_sharing (`bool`, *optional*, defaults to `False`):
+            Whether to forward the prompt shared by a group of completions once instead of once per completion.
+            Each group is packed into a single row, `[prompt | completion_1 | … | completion_G]`, with an explicit
+            attention mask so each completion sees the prompt and itself, and never another completion. This saves
+            the prompt compute when the prompt is much longer than the completions. Requires an attention
+            implementation that accepts a 4D attention mask (`sdpa` or `eager`); not supported with
+            `use_liger_kernel=True` or with vision-language models.
         sync_ref_model (`bool`, *optional*, defaults to `False`):
             Whether to synchronize the reference model with the active model every `ref_model_sync_steps` steps, using
             the `ref_model_mixup_alpha` parameter. This synchronization originates from the
@@ -853,6 +860,16 @@ class GRPOConfig(_BaseConfig):
             "help": "When enabled, truncated completions are excluded from the loss calculation, preventing them from "
             "being incorrectly penalized and introducing noise during training. According to the DAPO paper, this is "
             "a good practice for training stability."
+        },
+    )
+    prefix_sharing: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to forward the prompt shared by a group of completions once instead of once per "
+            "completion. Each group is packed into a single row with an explicit attention mask so each completion "
+            "sees the prompt and itself, and never another completion. Requires an attention implementation that "
+            "accepts a 4D attention mask (`sdpa` or `eager`); not supported with `use_liger_kernel=True` or with "
+            "vision-language models."
         },
     )
     sync_ref_model: bool = field(

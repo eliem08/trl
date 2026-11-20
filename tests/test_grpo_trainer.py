@@ -5161,3 +5161,163 @@ class TestGRPOTrainerVLM(TrlTestCase):
         for n, param in previous_trainable_params.items():
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
+
+class TestGRPOTrainerPrefixSharing(TrlTestCase):
+    def _make_trainer(self, prefix_sharing):
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_only", split="train")
+        training_args = GRPOConfig(
+            output_dir=self.tmp_dir,
+            bf16=False,  # compare in full precision
+            per_device_train_batch_size=2,  # reduce the batch size to reduce memory usage
+            num_generations=2,  # reduce the number of generations to reduce memory usage
+            temperature=0.7,
+            beta=0.0,  # no reference model is needed to score log-probs
+            prefix_sharing=prefix_sharing,
+            report_to="none",
+        )
+        return GRPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            reward_funcs=str_length_reward,
+            args=training_args,
+            train_dataset=dataset,
+        )
+
+    def _make_batch(self, device):
+        # Two groups sharing a prompt, rows interleaved (groups are not contiguous after `_prepare_inputs`
+        # shuffles), varied prompt/completion lengths, left-padded prompts, right-padded completions, and one
+        # fully masked completion, as `mask_truncated_completions` produces.
+        torch.manual_seed(0)
+        prompt_a = torch.randint(5, 100, (5,))
+        prompt_b = torch.randint(5, 100, (4,))
+        prompts = [prompt_a, prompt_b, prompt_a, prompt_b, prompt_a, prompt_b]
+        completions = [
+            torch.randint(5, 100, (3,)),
+            torch.randint(5, 100, (2,)),
+            torch.randint(5, 100, (5,)),
+            torch.randint(5, 100, (4,)),
+            torch.empty(0, dtype=torch.long),
+            torch.randint(5, 100, (1,)),
+        ]
+        prompt_width, completion_width = 6, 5
+        input_ids = torch.zeros((6, prompt_width + completion_width), dtype=torch.long)
+        attention_mask = torch.zeros((6, prompt_width + completion_width), dtype=torch.long)
+        for row, (prompt, completion) in enumerate(zip(prompts, completions, strict=True)):
+            input_ids[row, prompt_width - len(prompt) : prompt_width] = prompt
+            attention_mask[row, prompt_width - len(prompt) : prompt_width] = 1
+            input_ids[row, prompt_width : prompt_width + len(completion)] = completion
+            attention_mask[row, prompt_width : prompt_width + len(completion)] = 1
+        return input_ids.to(device), attention_mask.to(device), completion_width
+
+    def test_prefix_sharing_matches_padded_forward(self):
+        # Packing a group into one row must not change the per-token log-probs: the prompt is forwarded once,
+        # each completion sees the prompt and itself, and the first token of every completion after the first is
+        # scored from a duplicate of the last prompt token.
+        dense_trainer = self._make_trainer(prefix_sharing=False)
+        packed_trainer = self._make_trainer(prefix_sharing=True)
+        input_ids, attention_mask, logits_to_keep = self._make_batch(dense_trainer.accelerator.device)
+        with torch.no_grad():
+            dense_logps, dense_entropies, _ = dense_trainer._get_per_token_logps_and_entropies(
+                dense_trainer.model, input_ids, attention_mask, logits_to_keep, compute_entropy=True
+            )
+            packed_logps, packed_entropies, _ = packed_trainer._get_per_token_logps_and_entropies(
+                packed_trainer.model, input_ids, attention_mask, logits_to_keep, compute_entropy=True
+            )
+            # A small dense chunk size forces the packed path to forward in several chunks.
+            chunked_logps, chunked_entropies, _ = packed_trainer._get_per_token_logps_and_entropies(
+                packed_trainer.model,
+                input_ids,
+                attention_mask,
+                logits_to_keep,
+                batch_size=2,
+                compute_entropy=True,
+            )
+        real = attention_mask[:, -logits_to_keep:].bool()
+        assert packed_logps.shape == dense_logps.shape == (6, logits_to_keep)
+        torch.testing.assert_close(packed_logps[real], dense_logps[real], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(packed_entropies[real], dense_entropies[real], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(chunked_logps[real], dense_logps[real], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(chunked_entropies[real], dense_entropies[real], atol=1e-4, rtol=1e-4)
+        assert torch.all(packed_logps[~real] == 0)
+
+        release_memory(dense_trainer.model, dense_trainer)
+        release_memory(packed_trainer.model, packed_trainer)
+
+    def test_prefix_sharing_backward(self):
+        # The scatter back to the padded layout must carry gradients to the model.
+        trainer = self._make_trainer(prefix_sharing=True)
+        input_ids, attention_mask, logits_to_keep = self._make_batch(trainer.accelerator.device)
+        logps, _, _ = trainer._get_per_token_logps_and_entropies(
+            trainer.model, input_ids, attention_mask, logits_to_keep
+        )
+        logps.sum().backward()
+        assert trainer.model.get_input_embeddings().weight.grad is not None
+
+        release_memory(trainer.model, trainer)
+
+    def test_prefix_sharing_rejects_liger_kernel(self):
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_only", split="train")
+        training_args = GRPOConfig(
+            output_dir=self.tmp_dir, prefix_sharing=True, use_liger_kernel=True, report_to="none"
+        )
+        with pytest.raises(ValueError, match="use_liger_kernel"):
+            GRPOTrainer(
+                model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+                reward_funcs=str_length_reward,
+                args=training_args,
+                train_dataset=dataset,
+            )
+
+    def test_prefix_sharing_rejects_flash_attention(self):
+        # Flash Attention cannot be instantiated on CPU, so the guard is exercised by setting the resolved
+        # implementation on a real sdpa model.
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_only", split="train")
+        model = AutoModelForCausalLM.from_pretrained(
+            "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", attn_implementation="sdpa"
+        )
+        model.config._attn_implementation = "flash_attention_2"
+        training_args = GRPOConfig(output_dir=self.tmp_dir, prefix_sharing=True, report_to="none")
+        with pytest.raises(ValueError, match="requires an attention implementation"):
+            GRPOTrainer(model=model, reward_funcs=str_length_reward, args=training_args, train_dataset=dataset)
+
+    def test_prefix_sharing_rejects_empty_prompt(self):
+        # A sample without a prompt token has no predecessor for its first completion token in the packed row.
+        trainer = self._make_trainer(prefix_sharing=True)
+        input_ids, attention_mask, logits_to_keep = self._make_batch(trainer.accelerator.device)
+        attention_mask[0, :-logits_to_keep] = 0  # strip row 0's prompt
+        with pytest.raises(ValueError, match="at least one prompt token"):
+            trainer._get_per_token_logps_and_entropies(trainer.model, input_ids, attention_mask, logits_to_keep)
+
+        release_memory(trainer.model, trainer)
+
+    def test_train_with_prefix_sharing(self):
+        # End to end: generation, the old/reference packed forwards and the policy packed forward in the loss.
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_only", split="train")
+        training_args = GRPOConfig(
+            output_dir=self.tmp_dir,
+            learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
+            per_device_train_batch_size=3,  # reduce the batch size to reduce memory usage
+            num_generations=3,  # reduce the number of generations to reduce memory usage
+            max_completion_length=8,  # reduce the completion length to reduce memory usage
+            prefix_sharing=True,
+            report_to="none",
+        )
+        trainer = GRPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            reward_funcs=str_length_reward,
+            args=training_args,
+            train_dataset=dataset,
+        )
+
+        previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
+
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+
+        # Check that the params have changed
+        for n, param in previous_trainable_params.items():
+            new_param = trainer.model.get_parameter(n)
+            assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
+        release_memory(trainer.model, trainer)

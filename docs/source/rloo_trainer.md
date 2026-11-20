@@ -221,6 +221,20 @@ In this mode, vLLM runs in a separate process (and using separate GPUs) and comm
 
 For more information, see [Speeding up training with vLLM](speeding_up_training#vllm-for-fast-generation-in-online-methods).
 
+### Prefix sharing
+
+By default the per-token log-prob forward runs on a dense block: prompts are left-padded and completions right-padded to the longest sequence in the micro-batch, and every completion of a group forwards the shared prompt again. With `prefix_sharing=True`, each group is packed into a single row, `[prompt | completion_1 | … | completion_G]`, with an explicit attention mask so each completion sees the prompt and itself, and never another completion. The prompt is forwarded once per group instead of once per completion, which saves the most compute when the prompt is much longer than the completions. The per-token log-probs are scattered back into the padded layout, so every loss type and metric is unchanged.
+
+```python
+from trl import RLOOConfig
+
+training_args = RLOOConfig(..., prefix_sharing=True)
+```
+
+`prefix_sharing=True` requires an attention implementation that accepts a 4D attention mask (`sdpa` or `eager`) and is not supported with `use_liger_kernel=True` or with vision-language models.
+
+The isolation depends on every sequence-mixing layer being attention: a hybrid architecture with recurrent or state-space layers that read the whole row (Jamba, for example) is not separated by the attention mask, and `prefix_sharing=True` silently mixes completions on it. A 4D mask is passed through as-is, so sliding-window attention is not applied on top of it — a sliding-window model attends to the full packed row, which is correct but not window-limited.
+
 ### RLOO at scale: train a 70B+ Model on multiple nodes
 
 When training large models like **Qwen2.5-72B**, you need several key optimizations to make the training efficient and scalable across multiple GPUs and nodes. These include:
